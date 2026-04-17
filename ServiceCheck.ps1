@@ -1,111 +1,124 @@
-# ==============================================================================
-# Windows Service Auditor
-# logic: Registry -> Get-Service -> SC Query
-# ==============================================================================
-
-# 1. Get current user + all group SIDs
+# 1. Identity Setup
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$userSIDs = $currentUser.Groups | ForEach-Object { $_.Value }
-$userSIDs += $currentUser.User.Value
+$userSIDs = $currentUser.Groups.Value + $currentUser.User.Value
+$sddlMap = @{ "AU"="S-1-5-11"; "BA"="S-1-5-32-544"; "BU"="S-1-5-32-545"; "IU"="S-1-5-4"; "SU"="S-1-5-6"; "SY"="S-1-5-18"; "LS"="S-1-5-19"; "NS"="S-1-5-20"; "WD"="S-1-1-0"; "RD"="S-1-5-32-555" }
 
-# Well-known SID mapping (SDDL short names)
-$sddlMap = @{ 
-    "AU"="S-1-5-11"; "BA"="S-1-5-32-544"; "BU"="S-1-5-32-545"; 
-    "IU"="S-1-5-4"; "SU"="S-1-5-6"; "SY"="S-1-5-18"; 
-    "LS"="S-1-5-19"; "NS"="S-1-5-20"; "WD"="S-1-1-0"; "RD"="S-1-5-32-555" 
+# 2. Rights Definitions
+$writeBit    = [System.Security.AccessControl.FileSystemRights]::Write
+$modifyBit   = [System.Security.AccessControl.FileSystemRights]::Modify
+$fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+$changePerms = [System.Security.AccessControl.FileSystemRights]::ChangePermissions
+$takeOwn     = [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+
+function Test-IsExploitable($acc) {
+    if ($acc.PropagationFlags -match "InheritOnly") { return $false }
+    $rights = $acc.FileSystemRights
+    return (($rights -band $writeBit) -eq $writeBit -or ($rights -band $modifyBit) -eq $modifyBit -or ($rights -band $fullControl) -eq $fullControl -or ($rights -band $changePerms) -eq $changePerms -or ($rights -band $takeOwn) -eq $takeOwn)
 }
 
+# 3. Enumeration Status
 $serviceNames = @()
-
-# Attempt 1: Registry
-try {
-    $serviceNames = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services" -ErrorAction Stop | Select-Object -ExpandProperty PSChildName
-    Write-Host "[*] Enumerating via Registry..." -ForegroundColor Gray
-} catch {
-    # Attempt 2: PowerShell Get-Service
-    try {
-        Write-Host "[!] Registry blocked. Trying Get-Service..." -ForegroundColor Yellow
-        $serviceNames = Get-Service -ErrorAction Stop | Select-Object -ExpandProperty Name
-    } catch {
-        # Attempt 3: Native sc.exe query
-        Write-Host "[!!] Get-Service blocked. Falling back to sc.exe query..." -ForegroundColor Red
-        $scQuery = sc.exe query state= all
-        $serviceNames = $scQuery | Select-String "SERVICE_NAME: (.*)" | ForEach-Object { $_.Matches.Groups[1].Value.Trim() }
+try { $serviceNames = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services" -ErrorAction Stop | Select-Object -ExpandProperty PSChildName } catch {
+    try { $serviceNames = Get-Service -ErrorAction Stop | Select-Object -ExpandProperty Name } catch {
+        $serviceNames = (sc.exe query state= all | Select-String "SERVICE_NAME: (.*)").Matches.Groups[1].Value.Trim()
     }
 }
-
-# Remove duplicates if any
 $serviceNames = $serviceNames | Select-Object -Unique
 
 foreach ($serviceName in $serviceNames) {
     try {
-        # 3. Get Service Permissions via SDDL
         $sddl = sc.exe sdshow $serviceName 2>$null
-        if (-not $sddl -or $sddl -match "FAILED") { continue }
-
         $hasStart = $false; $hasStop = $false; $hasConf = $false
-        $aces = $sddl -split '\)'
-        
-        foreach ($ace in $aces) {
-            if ($ace -match '\(A;;([^;]+);;;([A-Z0-9\-]+)') {
-                $rights = $matches[1]
-                $idRaw = $matches[2]
-                $sid = if ($idRaw -match '^S-1-') { $idRaw } else { $sddlMap[$idRaw] }
-                
-                if ($userSIDs -contains $sid) {
-                    if ($rights -match 'RP') { $hasStart = $true }
-                    if ($rights -match 'WP') { $hasStop  = $true }
-                    if ($rights -match 'DC') { $hasConf  = $true }
+
+        if ($sddl -and $sddl -notmatch "FAILED") {
+            $aces = $sddl -split '\)'
+            foreach ($ace in $aces) {
+                # Extract Rights ($matches[1]) and SID ($matches[2])
+                if ($ace -match '\(A;;([^;]+);;;([A-Z0-9\-]+)') {
+                    $foundSid = $matches[2]
+                    $perms = $matches[1]
+
+                    # Resolve abbreviation to SID string if necessary
+                    $resolvedSid = if ($sddlMap.ContainsKey($foundSid)) { $sddlMap[$foundSid] } else { $foundSid }
+
+                    # THE CRITICAL CHECK: Does this ACE apply to YOU?
+                    if ($userSIDs -contains $resolvedSid) {
+                        # RP = Start | DT or WP = Stop | DC = Config | GA = Generic All
+                        if ($perms -match 'RP|GA|GX') { $hasStart = $true }
+                        if ($perms -match 'DT|WP|GA|GX') { $hasStop = $true }
+                        if ($perms -match 'DC|GA') { $hasConf = $true }
+                    }
                 }
             }
         }
 
-        # 4. DECISION LOGIC
+        # --- HIERARCHY: Config Access First ---
         if ($hasConf) {
-            Write-Host "[+] CONFIGURABLE SERVICE: $serviceName" -ForegroundColor Green
+            Write-Host "[+] CONFIGURABLE SERVICE: ${serviceName}" -ForegroundColor Green
+            Write-Host "    -> Control: Start($hasStart) Stop($hasStop)"
             continue 
         }
 
-        if ($hasStart -or $hasStop) {
-            # 5. Get Binary Path (Registry -> sc qc Fallback)
-            $binPath = ""
-            $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
-            if (Test-Path $regPath) {
-                $binPath = (Get-ItemProperty $regPath -Name "ImagePath" -ErrorAction SilentlyContinue).ImagePath
-            }
-            if (-not $binPath) {
-                $qc = sc.exe qc $serviceName 2>$null
-                if ($qc -match "BINARY_PATH_NAME\s+:\s+(.*)") { $binPath = $matches[1].Trim() }
-            }
+        # 5. Resolve Paths ONLY if we didn't have Config access
+        $binPath = ""
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+        if (Test-Path $regPath) { $binPath = (Get-ItemProperty $regPath -Name "ImagePath" -ErrorAction SilentlyContinue).ImagePath }
+        if (-not $binPath) { $qc = sc.exe qc $serviceName 2>$null; if ($qc -match "BINARY_PATH_NAME\s+:\s+(.*)") { $binPath = $matches[1].Trim() } }
+        if (-not $binPath) { continue }
 
-            if ($binPath) {
-                # Clean path (Remove quotes/args)
-                if ($binPath -match '^"([^"]+)"') { $cleanPath = $matches[1] } 
-                else { $cleanPath = $binPath.Split(' ')[0] }
+        if ($binPath -match '^"([^"]+)"') { $cleanPath = $matches[1] } 
+        elseif ($binPath -match '^(.+\.(?:exe|dll|bat|cmd|com|sys))') { $cleanPath = $matches[1].Trim() }
+        else { $cleanPath = $binPath.Split(' ')[0] }
 
-                if (-not (Test-Path $cleanPath)) { continue }
-                $parentDir = Split-Path $cleanPath
+        # --- MODULE 1: UNQUOTED HIJACK ---
+        if ($binPath -notmatch '^"' -and $cleanPath -match ' ') {
+	    $pathParts = $cleanPath.Split('\')
+	    $pathBuild = ""
+	    for ($i = 0; $i -lt ($pathParts.Count - 1); $i++) {
+		
+		# Build the path
+		if ($pathBuild -eq "") { 
+		    $pathBuild = $pathParts[$i] 
+		} else { 
+		    $pathBuild += "\" + $pathParts[$i] 
+		}
 
-                # Check Binary and Directory ACLs
-                $targets = @($cleanPath, $parentDir)
-                foreach ($target in $targets) {
-                    $acl = Get-Acl $target -ErrorAction SilentlyContinue
-                    if (-not $acl) { continue }
+		$testPath = $pathBuild
+		if ($testPath -match '^[a-zA-Z]:$') { $testPath += "\" }
 
-                    foreach ($access in $acl.Access) {
-                        try {
-                            $aceSid = $access.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-                            if ($userSIDs -contains $aceSid) {
-                                $perms = $access.FileSystemRights.ToString()
-                                if ($perms -match "Write|Modify|FullControl|Delete") {
-                                    $type = if ($target -eq $cleanPath) { "BINARY" } else { "DIRECTORY" }
-                                    Write-Host "[!] WEAK $type PERMS: $serviceName" -ForegroundColor Cyan
-                                    Write-Host "    -> Path: $target"
-                                    Write-Host "    -> Your Rights: $perms"
-                                    Write-Host "    -> Service Control: Start($hasStart) Stop($hasStop)"
-                                }
-                            }
-                        } catch { continue }
+		if (Test-Path $testPath) {
+		    $acl = Get-Acl $testPath -ErrorAction SilentlyContinue
+		    foreach ($acc in $acl.Access) {
+		        try {
+		            $sid = $acc.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+		            if ($userSIDs -contains $sid -and (Test-IsExploitable $acc)) {
+		                if ($pathParts[$i+1] -match ' ') {
+		                    $payload = $pathParts[$i+1].Split(' ')[0] + ".exe"
+		                    Write-Host "[!] UNQUOTED HIJACK: ${serviceName}" -ForegroundColor Magenta
+		                    Write-Host "    -> Folder: ${testPath}" -ForegroundColor Cyan
+		                    Write-Host "    -> Your Rights: $($acc.FileSystemRights)" -ForegroundColor Yellow
+		                    Write-Host "    -> Control: Start($hasStart) Stop($hasStop)" -ForegroundColor White
+		                }
+		            }
+		        } catch { continue }
+		    }
+		}
+	    }
+	}
+        # --- MODULE 2: DIRECT FILE CHECK ---
+        if (Test-Path $cleanPath) {
+            $targets = @($cleanPath, (Split-Path $cleanPath))
+            foreach ($t in $targets) {
+                $acl = Get-Acl $t -ErrorAction SilentlyContinue
+                if (-not $acl) { continue }
+                foreach ($acc in $acl.Access) {
+                    $sid = try { $acc.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { continue }
+                    if ($userSIDs -contains $sid -and (Test-IsExploitable $acc)) {
+                        $type = if ($t -eq $cleanPath) { "BINARY" } else { "DIR" }
+                        Write-Host "[!] DIRECT WEAKNESS (${type}): ${serviceName}" -ForegroundColor Cyan
+                        Write-Host "    -> Path: ${t}" -ForegroundColor Gray
+                        Write-Host "    -> Your Rights: $($acc.FileSystemRights)" -ForegroundColor Yellow # RESTORED
+                        Write-Host "    -> Control: Start($hasStart) Stop($hasStop)" -ForegroundColor White
                     }
                 }
             }
