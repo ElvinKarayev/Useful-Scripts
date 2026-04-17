@@ -18,9 +18,17 @@ function Test-IsExploitable($acc) {
 
 # 3. Enumeration Status
 $serviceNames = @()
-try { $serviceNames = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services" -ErrorAction Stop | Select-Object -ExpandProperty PSChildName } catch {
-    try { $serviceNames = Get-Service -ErrorAction Stop | Select-Object -ExpandProperty Name } catch {
-        $serviceNames = (sc.exe query state= all | Select-String "SERVICE_NAME: (.*)").Matches.Groups[1].Value.Trim()
+try {
+    $serviceNames = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services" -ErrorAction Stop | Select-Object -ExpandProperty PSChildName
+    Write-Host "[*] Enumerating services via Registry..." -ForegroundColor Gray
+} catch {
+    try {
+        Write-Host "[!] Registry access DENIED. Trying Get-Service..." -ForegroundColor Yellow
+        $serviceNames = Get-Service -ErrorAction Stop | Select-Object -ExpandProperty Name
+    } catch {
+        Write-Host "[!!] Get-Service FAILED. Falling back to 'sc query'..." -ForegroundColor Red
+        $scQuery = sc.exe query state= all
+        $serviceNames = $scQuery | Select-String "SERVICE_NAME: (.*)" | ForEach-Object { $_.Matches.Groups[1].Value.Trim() }
     }
 }
 $serviceNames = $serviceNames | Select-Object -Unique
