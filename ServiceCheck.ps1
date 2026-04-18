@@ -8,6 +8,11 @@ if ($help) {
     Write-Host "Options:"
     Write-Host "  -obj    Output results as objects instead of strings"
     Write-Host "  -help   Show this help message"
+    Write-Host "Filter Options:"
+    Write-Host "  ServiceName"
+    Write-Host "  Rights"
+    Write-Host "  Path"
+    Write-Host "  Type:(Binary, Dir, Unquoted, ConfigurableService)"
     return
 }
 # 1. Identity Setup
