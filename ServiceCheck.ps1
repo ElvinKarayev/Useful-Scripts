@@ -12,7 +12,7 @@ if ($help) {
     Write-Host "  ServiceName"
     Write-Host "  Rights"
     Write-Host "  Path"
-    Write-Host "  Type:(Binary, Dir, Unquoted, ConfigurableService)"
+    Write-Host "  Type:(BINARY, DIR, UnquotedPath, ConfigurableService)"
     return
 }
 # 1. Identity Setup
